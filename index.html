@@ -1,622 +1,661 @@
-const express = require('express');
-const { exec, spawn } = require('child_process');
-const http = require('http');
-const { Server } = require('socket.io');
-const os = require('os');
-const fs = require('fs');
-const path = require('path');
-const multer = require('multer');
-const bcrypt = require('bcryptjs');
-const session = require('express-session');
-
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-
-// ============================================
-// НАСТРОЙКИ - ИЗМЕНИ ПОД СЕБЯ
-// ============================================
-const PORT = 3000;
-const SESSION_SECRET = 'my-super-secret-key-change-me-2024';
-
-// Файл с данными пользователей
-const USERS_FILE = path.join(__dirname, 'users.json');
-
-// ============================================
-// ИНИЦИАЛИЗАЦИЯ ПОЛЬЗОВАТЕЛЕЙ
-// ============================================
-function initUsers() {
-    if (!fs.existsSync(USERS_FILE)) {
-        const defaultPassword = bcrypt.hashSync('admin123', 10);
-        const users = {
-            admin: {
-                password: defaultPassword,
-                createdAt: new Date().toISOString()
-            }
-        };
-        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-        console.log('========================================');
-        console.log('СОЗДАН ПОЛЬЗОВАТЕЛЬ ПО УМОЛЧАНИЮ:');
-        console.log('Логин: admin');
-        console.log('Пароль: admin123');
-        console.log('ОБЯЗАТЕЛЬНО СМЕНИ ПАРОЛЬ!');
-        console.log('========================================');
-    }
-}
-
-function getUsers() {
-    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-}
-
-function saveUsers(users) {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-}
-
-initUsers();
-
-// ============================================
-// MIDDLEWARE
-// ============================================
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        maxAge: 24 * 60 * 60 * 1000 // 24 часа
-    }
-}));
-
-// Проверка авторизации
-function requireAuth(req, res, next) {
-    if (req.session && req.session.authenticated) {
-        return next();
-    }
-    if (req.path.startsWith('/api/')) {
-        return res.status(401).json({ error: 'Не авторизован' });
-    }
-    res.redirect('/login');
-}
-
-// ============================================
-// ЗАГРУЗКА ФАЙЛОВ (MULTER)
-// ============================================
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        const uploadPath = req.body.uploadPath || path.join(os.homedir(), 'uploads');
-        if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-        }
-        cb(null, uploadPath);
-    },
-    filename: function (req, file, cb) {
-        // Сохраняем оригинальное имя, декодируем UTF-8
-        const originalName = Buffer.from(file.originalname, 'latin1').toString('utf8');
-        cb(null, originalName);
-    }
-});
-
-const upload = multer({
-    storage: storage,
-    limits: { fileSize: 500 * 1024 * 1024 } // 500MB макс
-});
-
-// ============================================
-// СТРАНИЦА ВХОДА
-// ============================================
-app.get('/login', (req, res) => {
-    res.send(`
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Вход — Phone Server</title>
+    <title>Phone Server Panel</title>
+    <script src="/socket.io/socket.io.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            background: #0a0a1a;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-        }
-        .login-box {
-            background: #12122a;
-            border: 1px solid #2a2a4a;
-            border-radius: 20px;
-            padding: 50px 40px;
-            width: 380px;
-            text-align: center;
-        }
-        .login-box h1 {
-            color: #fff;
-            margin-bottom: 8px;
-            font-size: 28px;
-        }
-        .login-box p {
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 14px;
-        }
-        .login-box .icon {
-            font-size: 60px;
-            margin-bottom: 20px;
-        }
-        input {
-            width: 100%;
-            padding: 14px 18px;
-            margin-bottom: 16px;
-            background: #1a1a3a;
-            border: 1px solid #2a2a4a;
-            border-radius: 10px;
-            color: #e0e0e0;
-            font-size: 15px;
-            outline: none;
-            transition: border 0.3s;
-        }
-        input:focus { border-color: #6c63ff; }
-        input::placeholder { color: #555; }
-        button {
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #6c63ff, #5a52d5);
-            color: #fff;
-            border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-top: 8px;
-        }
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(108, 99, 255, 0.4);
-        }
-        .error {
-            background: #ff525220;
-            color: #ff5252;
-            padding: 10px;
-            border-radius: 8px;
-            margin-bottom: 16px;
-            font-size: 13px;
-            display: none;
-        }
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0a1a;color:#e0e0e0;min-height:100vh}
+        .header{background:linear-gradient(135deg,#1a1a3e,#2d1b69);padding:16px 28px;display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #6c63ff;position:sticky;top:0;z-index:100}
+        .header h1{font-size:22px;color:#fff}
+        .header h1 span{color:#6c63ff}
+        .header-right{display:flex;align-items:center;gap:14px}
+        .status-badge{background:#00c853;color:#000;padding:5px 14px;border-radius:20px;font-weight:bold;font-size:12px;animation:pulse 2s infinite}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.7}}
+        .btn-logout{background:#ff525230;color:#ff5252;border:1px solid #ff525050;padding:5px 14px;border-radius:8px;cursor:pointer;font-size:12px;text-decoration:none;transition:all .2s}
+        .btn-logout:hover{background:#ff5252;color:#fff}
+        .tabs{display:flex;background:#0f0f25;border-bottom:1px solid #2a2a4a;padding:0 20px;overflow-x:auto}
+        .tab{padding:14px 24px;cursor:pointer;color:#888;font-size:14px;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap;user-select:none}
+        .tab:hover{color:#ccc}
+        .tab.active{color:#6c63ff;border-bottom-color:#6c63ff}
+        .tab-content{display:none;padding:24px}
+        .tab-content.active{display:block}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
+        .card{background:#12122a;border-radius:16px;padding:24px;border:1px solid #2a2a4a;transition:all .3s}
+        .card:hover{border-color:#6c63ff40}
+        .card h2{color:#6c63ff;margin-bottom:18px;font-size:15px;text-transform:uppercase;letter-spacing:1px}
+        .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+        .stat-item{background:#1a1a3a;padding:16px;border-radius:12px;text-align:center}
+        .stat-value{font-size:26px;font-weight:bold;color:#6c63ff}
+        .stat-label{font-size:11px;color:#666;margin-top:4px;text-transform:uppercase}
+        .progress-bar{width:100%;height:8px;background:#1a1a3a;border-radius:4px;margin-top:8px;overflow:hidden}
+        .progress-fill{height:100%;border-radius:4px;transition:width .5s;background:linear-gradient(90deg,#6c63ff,#ff6584)}
+        .terminal-box{background:#0a0a16;border-radius:14px;overflow:hidden;border:1px solid #2a2a4a}
+        .terminal-header{background:#1a1a3a;padding:10px 16px;display:flex;align-items:center;gap:8px}
+        .dot{width:12px;height:12px;border-radius:50%}
+        .dot.r{background:#ff5f56}.dot.y{background:#ffbd2e}.dot.g{background:#27ca40}
+        .terminal-output{padding:16px;height:400px;overflow-y:auto;font-family:'Fira Code',Consolas,monospace;font-size:13px;line-height:1.7;white-space:pre-wrap}
+        .terminal-output .cmd{color:#6c63ff}
+        .terminal-output .stdout{color:#a0e0a0}
+        .terminal-output .stderr{color:#ff6b6b}
+        .terminal-input-wrap{display:flex;border-top:1px solid #2a2a4a}
+        .terminal-prompt{padding:12px 16px;color:#6c63ff;font-family:monospace;background:#0a0a16}
+        .terminal-input{flex:1;background:#0a0a16;border:none;color:#e0e0e0;font-family:'Fira Code',monospace;font-size:14px;padding:12px 0;outline:none}
+        .service-item{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:#1a1a3a;border-radius:12px;margin-bottom:10px;border:1px solid #2a2a4a}
+        .service-dot{width:10px;height:10px;border-radius:50%;background:#00c853;margin-right:12px;flex-shrink:0}
+        .service-info{flex:1}
+        .service-name{font-weight:bold;font-size:14px}
+        .service-meta{font-size:11px;color:#666;margin-top:3px}
+        .service-actions{display:flex;gap:6px}
+        .btn{padding:7px 16px;border:none;border-radius:8px;cursor:pointer;font-weight:bold;font-size:12px;transition:all .2s}
+        .btn:hover{transform:scale(1.05)}
+        .btn-start{background:#00c853;color:#000}
+        .btn-stop{background:#ff5252;color:#fff}
+        .btn-restart{background:#ff9800;color:#000}
+        .btn-primary{background:#6c63ff;color:#fff}
+        .btn-danger{background:#ff525230;color:#ff5252;border:1px solid #ff525050}
+        .btn-sm{padding:5px 12px;font-size:11px}
+        .form-row{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+        .form-row input{background:#1a1a3a;border:1px solid #2a2a4a;color:#e0e0e0;padding:10px 14px;border-radius:8px;font-size:13px;outline:none;flex:1;min-width:120px}
+        .form-row input:focus{border-color:#6c63ff}
+        .service-logs{background:#0a0a16;padding:12px;border-radius:10px;margin-top:12px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:12px;line-height:1.5;border:1px solid #1a1a3a}
+        .log-stdout{color:#a0e0a0}
+        .log-stderr{color:#ff6b6b}
+        .file-toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
+        .file-path-display{background:#1a1a3a;padding:10px 16px;border-radius:8px;font-family:monospace;font-size:13px;color:#6c63ff;flex:1;min-width:200px}
+        .file-list{max-height:500px;overflow-y:auto}
+        .file-item{display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:8px;cursor:pointer;transition:background .15s;border-bottom:1px solid #1a1a2a}
+        .file-item:hover{background:#1a1a3a}
+        .file-icon{font-size:20px;flex-shrink:0}
+        .file-name{flex:1;font-size:14px;word-break:break-all}
+        .file-meta{color:#666;font-size:12px;text-align:right;min-width:80px}
+        .file-actions{display:flex;gap:4px}
+        .upload-zone{border:2px dashed #2a2a4a;border-radius:14px;padding:40px;text-align:center;cursor:pointer;transition:all .3s;margin-top:16px}
+        .upload-zone:hover,.upload-zone.drag-over{border-color:#6c63ff;background:#6c63ff10}
+        .upload-zone .uicon{font-size:48px;margin-bottom:12px}
+        .upload-zone p{color:#888;font-size:14px}
+        .upload-progress{margin-top:12px;display:none}
+        .modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:#000000cc;z-index:200;justify-content:center;align-items:center;padding:20px}
+        .modal-overlay.active{display:flex}
+        .modal{background:#12122a;border-radius:16px;width:90%;max-width:900px;max-height:90vh;overflow:hidden;border:1px solid #2a2a4a}
+        .modal-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #2a2a4a}
+        .modal-header h3{color:#6c63ff;font-size:16px}
+        .modal-close{background:none;border:none;color:#888;font-size:24px;cursor:pointer}
+        .modal-body{padding:20px;overflow-y:auto;max-height:70vh}
+        .editor-textarea{width:100%;min-height:400px;background:#0a0a16;border:1px solid #2a2a4a;color:#e0e0e0;padding:16px;font-family:'Fira Code',monospace;font-size:13px;border-radius:10px;outline:none;resize:vertical;line-height:1.6}
+        .modal-footer{padding:14px 20px;border-top:1px solid #2a2a4a;display:flex;justify-content:flex-end;gap:10px}
+        .settings-group{background:#1a1a3a;padding:20px;border-radius:12px;margin-bottom:16px}
+        .settings-group h3{color:#6c63ff;margin-bottom:14px;font-size:14px}
+        .settings-row{display:flex;gap:12px;margin-bottom:10px}
+        .settings-row input{flex:1;background:#12122a;border:1px solid #2a2a4a;color:#e0e0e0;padding:10px 14px;border-radius:8px;outline:none;font-size:13px}
+        .toast{position:fixed;bottom:30px;right:30px;padding:14px 24px;border-radius:10px;color:#fff;font-size:14px;z-index:300;transform:translateY(100px);opacity:0;transition:all .3s}
+        .toast.show{transform:translateY(0);opacity:1}
+        .toast.success{background:#00c853}
+        .toast.error{background:#ff5252}
+        .toast.info{background:#6c63ff}
+        ::-webkit-scrollbar{width:6px}
+        ::-webkit-scrollbar-track{background:#0a0a1a}
+        ::-webkit-scrollbar-thumb{background:#2a2a4a;border-radius:3px}
     </style>
 </head>
 <body>
-    <div class="login-box">
-        <div class="icon">📱</div>
-        <h1>Phone Server</h1>
-        <p>Введите логин и пароль для доступа</p>
-        <div class="error" id="error">Неверный логин или пароль</div>
-        <form method="POST" action="/login" id="loginForm">
-            <input type="text" name="username" placeholder="Логин" required autofocus>
-            <input type="password" name="password" placeholder="Пароль" required>
-            <button type="submit">Войти →</button>
-        </form>
+
+<div class="header">
+    <h1>📱 <span>Phone</span> Server</h1>
+    <div class="header-right">
+        <div class="status-badge">● ONLINE</div>
+        <a href="/logout" class="btn-logout">Выйти</a>
     </div>
-    <script>
-        const urlParams = new URLSearchParams(window.location.search);
-        if (urlParams.get('error')) {
-            document.getElementById('error').style.display = 'block';
+</div>
+
+<div class="tabs">
+    <div class="tab active" data-tab="dashboard">📊 Дашборд</div>
+    <div class="tab" data-tab="terminal">💻 Терминал</div>
+    <div class="tab" data-tab="services">🤖 Сервисы</div>
+    <div class="tab" data-tab="files">📁 Файлы</div>
+    <div class="tab" data-tab="settings">⚙️ Настройки</div>
+</div>
+
+<!-- DASHBOARD -->
+<div class="tab-content active" id="tab-dashboard">
+    <div class="grid">
+        <div class="card">
+            <h2>📊 Система</h2>
+            <div class="stat-grid">
+                <div class="stat-item"><div class="stat-value" id="s-cpu">-</div><div class="stat-label">CPU Cores</div></div>
+                <div class="stat-item"><div class="stat-value" id="s-proc">-</div><div class="stat-label">Процессы</div></div>
+                <div class="stat-item"><div class="stat-value" id="s-uptime">-</div><div class="stat-label">Uptime</div></div>
+                <div class="stat-item"><div class="stat-value" id="s-services">0</div><div class="stat-label">Сервисы</div></div>
+            </div>
+            <div style="margin-top:18px">
+                <div style="display:flex;justify-content:space-between;font-size:13px"><span>💾 RAM</span><span id="s-mem-text">-</span></div>
+                <div class="progress-bar"><div class="progress-fill" id="s-mem-bar" style="width:0%"></div></div>
+            </div>
+            <div style="margin-top:14px">
+                <div style="display:flex;justify-content:space-between;font-size:13px"><span>💿 Диск</span><span id="s-disk-text">-</span></div>
+                <div class="progress-bar"><div class="progress-fill" id="s-disk-bar" style="width:0%"></div></div>
+            </div>
+        </div>
+        <div class="card">
+            <h2>🤖 Активные сервисы</h2>
+            <div id="dash-services"><div style="color:#666;text-align:center;padding:30px">Нет запущенных сервисов</div></div>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+            <h2>⚡ Быстрые команды</h2>
+            <div style="display:flex;gap:10px;flex-wrap:wrap">
+                <button class="btn btn-primary" onclick="quickCmd('whoami')">whoami</button>
+                <button class="btn btn-primary" onclick="quickCmd('pwd')">pwd</button>
+                <button class="btn btn-primary" onclick="quickCmd('df -h')">Диск</button>
+                <button class="btn btn-primary" onclick="quickCmd('uptime')">Uptime</button>
+                <button class="btn btn-primary" onclick="quickCmd('ls -la ~')">Home</button>
+                <button class="btn btn-primary" onclick="quickCmd('date')">Дата</button>
+            </div>
+            <pre id="quick-output" style="background:#0a0a16;padding:14px;border-radius:10px;margin-top:14px;font-size:13px;color:#a0e0a0;min-height:60px;max-height:200px;overflow-y:auto"></pre>
+        </div>
+    </div>
+</div>
+
+<!-- TERMINAL -->
+<div class="tab-content" id="tab-terminal">
+    <div class="terminal-box">
+        <div class="terminal-header">
+            <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
+            <span style="margin-left:12px;font-size:13px;color:#888">Termux Shell</span>
+            <button class="btn btn-sm btn-danger" style="margin-left:auto" onclick="clearTerminal()">Очистить</button>
+        </div>
+        <div class="terminal-output" id="term-out"><span class="stdout">Добро пожаловать в Phone Server Terminal! 🚀
+Вводите команды ниже.
+</span></div>
+        <div class="terminal-input-wrap">
+            <span class="terminal-prompt">$</span>
+            <input type="text" class="terminal-input" id="term-in" placeholder="Введите команду...">
+        </div>
+    </div>
+</div>
+
+<!-- SERVICES -->
+<div class="tab-content" id="tab-services">
+    <div class="card">
+        <h2>➕ Запустить сервис</h2>
+        <div class="form-row">
+            <input type="text" id="new-svc-name" placeholder="Имя (напр: telegram-bot)">
+            <input type="text" id="new-svc-cmd" placeholder="Команда (напр: python bot.py)">
+            <input type="text" id="new-svc-cwd" placeholder="Папка (необязательно)">
+            <button class="btn btn-start" onclick="startService()">▶ Запустить</button>
+        </div>
+    </div>
+    <div style="margin-top:20px" id="services-container">
+        <div style="color:#666;text-align:center;padding:40px">Нет запущенных сервисов</div>
+    </div>
+</div>
+
+<!-- FILES -->
+<div class="tab-content" id="tab-files">
+    <div class="card">
+        <div class="file-toolbar">
+            <div class="file-path-display" id="file-path">~</div>
+            <button class="btn btn-primary btn-sm" onclick="goHome()">🏠 Home</button>
+            <button class="btn btn-primary btn-sm" onclick="createFolder()">📁 Новая папка</button>
+            <button class="btn btn-primary btn-sm" onclick="document.getElementById('file-upload-input').click()">⬆️ Загрузить</button>
+        </div>
+        <div class="file-list" id="file-list"></div>
+        <div class="upload-zone" id="upload-zone">
+            <div class="uicon">📤</div>
+            <p>Перетащите файлы сюда или нажмите для выбора</p>
+            <p style="font-size:12px;margin-top:8px;color:#555">Максимум 500MB на файл</p>
+            <input type="file" id="file-upload-input" multiple style="display:none">
+        </div>
+        <div class="upload-progress" id="upload-progress">
+            <div class="progress-bar"><div class="progress-fill" id="upload-bar" style="width:0%"></div></div>
+            <div style="font-size:12px;color:#888;margin-top:6px" id="upload-status"></div>
+        </div>
+    </div>
+</div>
+
+<!-- SETTINGS -->
+<div class="tab-content" id="tab-settings">
+    <div class="grid">
+        <div class="card">
+            <h2>🔑 Сменить пароль</h2>
+            <div class="settings-group">
+                <div class="settings-row"><input type="password" id="cur-pass" placeholder="Текущий пароль"></div>
+                <div class="settings-row"><input type="password" id="new-pass" placeholder="Новый пароль"></div>
+                <div class="settings-row"><input type="password" id="new-pass2" placeholder="Повторите пароль"></div>
+                <button class="btn btn-primary" onclick="changePassword()" style="margin-top:8px">Сменить пароль</button>
+            </div>
+        </div>
+        <div class="card">
+            <h2>ℹ️ Информация</h2>
+            <div class="settings-group">
+                <p style="font-size:13px;color:#aaa;line-height:1.8">
+                    📱 <strong>Phone Server Panel</strong><br>
+                    Панель управления телефоном-сервером.<br><br>
+                    🌐 Panel: <code>http://IP:3000</code>
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- EDITOR MODAL -->
+<div class="modal-overlay" id="editor-modal">
+    <div class="modal">
+        <div class="modal-header">
+            <h3 id="editor-title">Редактор</h3>
+            <button class="modal-close" onclick="closeEditor()">x</button>
+        </div>
+        <div class="modal-body">
+            <textarea class="editor-textarea" id="editor-content"></textarea>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-danger" onclick="closeEditor()">Отмена</button>
+            <button class="btn btn-primary" onclick="saveFile()">💾 Сохранить</button>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+var socket = io();
+var currentFilePath = '';
+var editingFilePath = '';
+var cmdHistory = [];
+var historyIdx = -1;
+
+// TABS
+document.querySelectorAll('.tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+        document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+        document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+        tab.classList.add('active');
+        document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+    });
+});
+
+// TOAST
+function showToast(msg, type) {
+    if (!type) type = 'info';
+    var t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast ' + type + ' show';
+    setTimeout(function() { t.classList.remove('show'); }, 3000);
+}
+
+// SYSTEM
+function updateSystem() {
+    fetch('/api/system').then(function(r) { return r.json(); }).then(function(d) {
+        document.getElementById('s-cpu').textContent = d.cpus;
+        document.getElementById('s-proc').textContent = d.processes;
+        document.getElementById('s-mem-text').textContent = d.usedMemory + 'MB / ' + d.totalMemory + 'MB';
+        document.getElementById('s-mem-bar').style.width = d.memoryPercent + '%';
+        document.getElementById('s-disk-text').textContent = d.diskUsed + ' / ' + d.diskTotal;
+        document.getElementById('s-disk-bar').style.width = d.diskPercent + '%';
+        var h = Math.floor(d.uptime / 3600);
+        var m = Math.floor((d.uptime % 3600) / 60);
+        document.getElementById('s-uptime').textContent = h + 'h ' + m + 'm';
+    }).catch(function() {});
+}
+
+// QUICK CMD
+function quickCmd(cmd) {
+    fetch('/api/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: cmd })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        var out = d.stdout;
+        if (!out) out = d.stderr;
+        if (!out) out = d.error;
+        if (!out) out = 'OK';
+        document.getElementById('quick-output').textContent = out;
+    });
+}
+
+// TERMINAL
+var termIn = document.getElementById('term-in');
+termIn.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+        var cmd = termIn.value.trim();
+        if (!cmd) return;
+        cmdHistory.unshift(cmd);
+        historyIdx = -1;
+        appendTerm('$ ' + cmd, 'cmd');
+        socket.emit('terminal-input', { command: cmd });
+        termIn.value = '';
+    }
+    if (e.key === 'ArrowUp') {
+        historyIdx = Math.min(historyIdx + 1, cmdHistory.length - 1);
+        termIn.value = cmdHistory[historyIdx] ? cmdHistory[historyIdx] : '';
+        e.preventDefault();
+    }
+    if (e.key === 'ArrowDown') {
+        historyIdx = Math.max(historyIdx - 1, -1);
+        termIn.value = historyIdx >= 0 ? cmdHistory[historyIdx] : '';
+        e.preventDefault();
+    }
+});
+
+socket.on('terminal-output', function(data) {
+    if (data.stdout) appendTerm(data.stdout, 'stdout');
+    if (data.stderr) appendTerm(data.stderr, 'stderr');
+});
+
+function appendTerm(text, cls) {
+    var out = document.getElementById('term-out');
+    var span = document.createElement('span');
+    span.className = cls;
+    span.textContent = text + (text.endsWith('\n') ? '' : '\n');
+    out.appendChild(span);
+    out.scrollTop = out.scrollHeight;
+}
+
+function clearTerminal() {
+    document.getElementById('term-out').innerHTML = '<span class="stdout">Терминал очищен.\n</span>';
+}
+
+// SERVICES
+function updateServices() {
+    fetch('/api/services').then(function(r) { return r.json(); }).then(function(data) {
+        var entries = Object.entries(data);
+        document.getElementById('s-services').textContent = entries.length;
+
+        var dash = document.getElementById('dash-services');
+        if (entries.length === 0) {
+            dash.innerHTML = '<div style="color:#666;text-align:center;padding:20px">Нет запущенных сервисов</div>';
+        } else {
+            var html = '';
+            entries.forEach(function(entry) {
+                var name = entry[0];
+                var info = entry[1];
+                html += '<div class="service-item"><div class="service-dot"></div><div class="service-info"><div class="service-name">' + escapeHtml(name) + '</div><div class="service-meta">PID: ' + info.pid + ' | ' + escapeHtml(info.command) + '</div></div></div>';
+            });
+            dash.innerHTML = html;
         }
-    </script>
+
+        var cont = document.getElementById('services-container');
+        if (entries.length === 0) {
+            cont.innerHTML = '<div style="color:#666;text-align:center;padding:40px">Нет запущенных сервисов. Запустите через форму выше.</div>';
+        } else {
+            var html2 = '';
+            entries.forEach(function(entry) {
+                var name = entry[0];
+                var info = entry[1];
+                var logsHtml = '';
+                if (info.logs) {
+                    info.logs.forEach(function(l) {
+                        logsHtml += '<span class="log-' + l.type + '">' + escapeHtml(l.text) + '</span>';
+                    });
+                }
+                html2 += '<div class="card" style="margin-bottom:16px">';
+                html2 += '<div class="service-item" style="margin-bottom:0">';
+                html2 += '<div style="display:flex;align-items:center"><div class="service-dot"></div>';
+                html2 += '<div class="service-info"><div class="service-name">' + escapeHtml(name) + '</div>';
+                html2 += '<div class="service-meta">PID: ' + info.pid + ' | ' + escapeHtml(info.command) + ' | ' + escapeHtml(info.cwd) + '</div></div></div>';
+                html2 += '<div class="service-actions">';
+                html2 += '<button class="btn btn-restart btn-sm" onclick="restartService(\'' + escapeAttr(name) + '\')">🔄</button>';
+                html2 += '<button class="btn btn-stop btn-sm" onclick="stopService(\'' + escapeAttr(name) + '\')">■ Stop</button>';
+                html2 += '</div></div>';
+                html2 += '<div class="service-logs" id="logs-' + escapeAttr(name) + '">' + logsHtml + '</div></div>';
+            });
+            cont.innerHTML = html2;
+        }
+    }).catch(function() {});
+}
+
+function startService() {
+    var name = document.getElementById('new-svc-name').value.trim();
+    var command = document.getElementById('new-svc-cmd').value.trim();
+    var cwd = document.getElementById('new-svc-cwd').value.trim();
+    if (!name || !command) { showToast('Заполните имя и команду', 'error'); return; }
+    fetch('/api/service/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, command: command, cwd: cwd ? cwd : undefined })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) {
+            showToast('Сервис ' + name + ' запущен!', 'success');
+            document.getElementById('new-svc-name').value = '';
+            document.getElementById('new-svc-cmd').value = '';
+            document.getElementById('new-svc-cwd').value = '';
+            updateServices();
+        } else { showToast(d.error, 'error'); }
+    });
+}
+
+function stopService(name) {
+    fetch('/api/service/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name })
+    }).then(function() { showToast('Сервис ' + name + ' остановлен', 'info'); setTimeout(updateServices, 500); });
+}
+
+function restartService(name) {
+    fetch('/api/service/restart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name })
+    }).then(function() { showToast('Сервис ' + name + ' перезапускается', 'info'); setTimeout(updateServices, 1500); });
+}
+
+socket.on('service-log', function(data) {
+    var el = document.getElementById('logs-' + data.service);
+    if (el) {
+        var span = document.createElement('span');
+        span.className = 'log-' + data.type;
+        span.textContent = data.data;
+        el.appendChild(span);
+        el.scrollTop = el.scrollHeight;
+    }
+});
+
+socket.on('service-stopped', function(data) {
+    showToast('Сервис ' + data.name + ' остановился (код: ' + data.code + ')', 'error');
+    setTimeout(updateServices, 500);
+});
+
+// FILES
+function loadFiles(dirPath) {
+    fetch('/api/files?path=' + encodeURIComponent(dirPath ? dirPath : '')).then(function(r) { return r.json(); }).then(function(data) {
+        if (data.error) { showToast(data.error, 'error'); return; }
+        currentFilePath = data.path;
+        document.getElementById('file-path').textContent = currentFilePath;
+        var list = document.getElementById('file-list');
+        list.innerHTML = '';
+
+        var parent = document.createElement('div');
+        parent.className = 'file-item';
+        parent.innerHTML = '<span class="file-icon">⬆️</span><span class="file-name">..</span><span class="file-meta">Наверх</span>';
+        parent.onclick = function() {
+            var parts = currentFilePath.split('/');
+            parts.pop();
+            loadFiles(parts.join('/') ? parts.join('/') : '/');
+        };
+        list.appendChild(parent);
+
+        var sorted = data.items.sort(function(a, b) {
+            if (a.isDirectory && !b.isDirectory) return -1;
+            if (!a.isDirectory && b.isDirectory) return 1;
+            return a.name.localeCompare(b.name);
+        });
+
+        sorted.forEach(function(item) {
+            var el = document.createElement('div');
+            el.className = 'file-item';
+            var icon = item.isDirectory ? '📁' : getFileIcon(item.name);
+            var size = item.isDirectory ? '' : formatSize(item.size);
+            var fullPath = currentFilePath + '/' + item.name;
+
+            var actionsHtml = '';
+            if (!item.isDirectory) {
+                actionsHtml += '<button class="btn btn-sm btn-primary" onclick="event.stopPropagation();editFile(\'' + escapeAttr(fullPath) + '\')">✏️</button>';
+                actionsHtml += '<button class="btn btn-sm btn-primary" onclick="event.stopPropagation();downloadFile(\'' + escapeAttr(fullPath) + '\')">⬇️</button>';
+            }
+            actionsHtml += '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteFile(\'' + escapeAttr(fullPath) + '\',\'' + escapeAttr(item.name) + '\')">🗑</button>';
+
+            el.innerHTML = '<span class="file-icon">' + icon + '</span><span class="file-name">' + escapeHtml(item.name) + '</span><span class="file-meta">' + size + '</span><div class="file-actions">' + actionsHtml + '</div>';
+
+            if (item.isDirectory) {
+                el.onclick = function() { loadFiles(fullPath); };
+            }
+            list.appendChild(el);
+        });
+    }).catch(function() { showToast('Ошибка загрузки файлов', 'error'); });
+}
+
+function goHome() { loadFiles(''); }
+
+function deleteFile(filePath, name) {
+    if (!confirm('Удалить "' + name + '"?')) return;
+    fetch('/api/files/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: filePath })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast('Удалено!', 'success'); loadFiles(currentFilePath); }
+        else showToast(d.error, 'error');
+    });
+}
+
+function createFolder() {
+    var name = prompt('Имя новой папки:');
+    if (!name) return;
+    fetch('/api/files/mkdir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dirPath: currentFilePath + '/' + name })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast('Папка создана', 'success'); loadFiles(currentFilePath); }
+        else showToast(d.error, 'error');
+    });
+}
+
+function downloadFile(filePath) {
+    window.open('/api/files/download?path=' + encodeURIComponent(filePath), '_blank');
+}
+
+function editFile(filePath) {
+    fetch('/api/files/read?path=' + encodeURIComponent(filePath)).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.error) { showToast(d.error, 'error'); return; }
+        editingFilePath = filePath;
+        document.getElementById('editor-title').textContent = '✏️ ' + filePath.split('/').pop();
+        document.getElementById('editor-content').value = d.content;
+        document.getElementById('editor-modal').classList.add('active');
+    }).catch(function() { showToast('Не удалось открыть файл', 'error'); });
+}
+
+function closeEditor() {
+    document.getElementById('editor-modal').classList.remove('active');
+}
+
+function saveFile() {
+    var content = document.getElementById('editor-content').value;
+    fetch('/api/files/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: editingFilePath, content: content })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast('Файл сохранён!', 'success'); closeEditor(); }
+        else showToast(d.error, 'error');
+    });
+}
+
+// UPLOAD
+var uploadZone = document.getElementById('upload-zone');
+var uploadInput = document.getElementById('file-upload-input');
+uploadZone.addEventListener('click', function() { uploadInput.click(); });
+uploadZone.addEventListener('dragover', function(e) { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+uploadZone.addEventListener('dragleave', function() { uploadZone.classList.remove('drag-over'); });
+uploadZone.addEventListener('drop', function(e) { e.preventDefault(); uploadZone.classList.remove('drag-over'); handleUpload(e.dataTransfer.files); });
+uploadInput.addEventListener('change', function(e) { handleUpload(e.target.files); });
+
+function handleUpload(files) {
+    if (!files.length) return;
+    var formData = new FormData();
+    formData.append('uploadPath', currentFilePath ? currentFilePath : '');
+    for (var i = 0; i < files.length; i++) {
+        formData.append('files', files[i]);
+    }
+    var prog = document.getElementById('upload-progress');
+    var bar = document.getElementById('upload-bar');
+    var status = document.getElementById('upload-status');
+    prog.style.display = 'block';
+    status.textContent = 'Загрузка...';
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+            var pct = (e.loaded / e.total * 100).toFixed(0);
+            bar.style.width = pct + '%';
+            status.textContent = pct + '% — ' + formatSize(e.loaded) + ' / ' + formatSize(e.total);
+        }
+    };
+    xhr.onload = function() {
+        var d = JSON.parse(xhr.responseText);
+        if (d.success) {
+            showToast(d.files.length + ' файл(ов) загружено!', 'success');
+            loadFiles(currentFilePath);
+        } else { showToast(d.error, 'error'); }
+        setTimeout(function() { prog.style.display = 'none'; bar.style.width = '0%'; }, 2000);
+    };
+    xhr.onerror = function() { showToast('Ошибка загрузки', 'error'); prog.style.display = 'none'; };
+    xhr.send(formData);
+    uploadInput.value = '';
+}
+
+// SETTINGS
+function changePassword() {
+    var cur = document.getElementById('cur-pass').value;
+    var n1 = document.getElementById('new-pass').value;
+    var n2 = document.getElementById('new-pass2').value;
+    if (!cur || !n1) { showToast('Заполните все поля', 'error'); return; }
+    if (n1 !== n2) { showToast('Пароли не совпадают', 'error'); return; }
+    if (n1.length < 4) { showToast('Минимум 4 символа', 'error'); return; }
+    fetch('/api/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword: cur, newPassword: n1 })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) {
+            showToast('Пароль изменён!', 'success');
+            document.getElementById('cur-pass').value = '';
+            document.getElementById('new-pass').value = '';
+            document.getElementById('new-pass2').value = '';
+        } else { showToast(d.error, 'error'); }
+    });
+}
+
+// HELPERS
+function escapeHtml(s) {
+    if (!s) return '';
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function escapeAttr(s) {
+    if (!s) return '';
+    return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+function formatSize(b) {
+    if (b > 1073741824) return (b / 1073741824).toFixed(1) + ' GB';
+    if (b > 1048576) return (b / 1048576).toFixed(1) + ' MB';
+    if (b > 1024) return (b / 1024).toFixed(1) + ' KB';
+    return b + ' B';
+}
+function getFileIcon(name) {
+    var ext = name.split('.').pop().toLowerCase();
+    var icons = {py:'🐍',js:'📜',json:'📋',html:'🌐',css:'🎨',md:'📝',txt:'📄',log:'📋',sh:'⚡',png:'🖼',jpg:'🖼',mp3:'🎵',mp4:'🎬',zip:'📦',pdf:'📕'};
+    return icons[ext] ? icons[ext] : '📄';
+}
+
+// INIT
+updateSystem();
+loadFiles('');
+updateServices();
+setInterval(updateSystem, 5000);
+setInterval(updateServices, 5000);
+</script>
 </body>
 </html>
-    `);
-});
-
-app.post('/login', (req, res) => {
-    const { username, password } = req.body;
-    const users = getUsers();
-
-    if (users[username] && bcrypt.compareSync(password, users[username].password)) {
-        req.session.authenticated = true;
-        req.session.username = username;
-        res.redirect('/');
-    } else {
-        res.redirect('/login?error=1');
-    }
-});
-
-app.get('/logout', (req, res) => {
-    req.session.destroy();
-    res.redirect('/login');
-});
-
-// ============================================
-// API: СМЕНА ПАРОЛЯ
-// ============================================
-app.post('/api/change-password', requireAuth, (req, res) => {
-    const { currentPassword, newPassword } = req.body;
-    const users = getUsers();
-    const username = req.session.username;
-
-    if (!bcrypt.compareSync(currentPassword, users[username].password)) {
-        return res.json({ success: false, error: 'Неверный текущий пароль' });
-    }
-
-    users[username].password = bcrypt.hashSync(newPassword, 10);
-    saveUsers(users);
-    res.json({ success: true });
-});
-
-// ============================================
-// API: СИСТЕМНАЯ ИНФОРМАЦИЯ
-// ============================================
-app.get('/api/system', requireAuth, (req, res) => {
-    const uptime = os.uptime();
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-
-    exec('ps aux 2>/dev/null | wc -l || echo 0', (err, stdout) => {
-        exec('df -h $HOME 2>/dev/null | tail -1', (err2, dfOut) => {
-            let diskTotal = '-', diskUsed = '-', diskPercent = '0';
-            if (dfOut) {
-                const parts = dfOut.trim().split(/\s+/);
-                if (parts.length >= 5) {
-                    diskTotal = parts[1];
-                    diskUsed = parts[2];
-                    diskPercent = parts[4].replace('%', '');
-                }
-            }
-
-            res.json({
-                hostname: os.hostname(),
-                platform: os.platform(),
-                arch: os.arch(),
-                uptime: uptime,
-                totalMemory: (totalMem / 1024 / 1024).toFixed(0),
-                freeMemory: (freeMem / 1024 / 1024).toFixed(0),
-                usedMemory: ((totalMem - freeMem) / 1024 / 1024).toFixed(0),
-                memoryPercent: (((totalMem - freeMem) / totalMem) * 100).toFixed(1),
-                processes: parseInt(stdout.trim()) - 1 || 0,
-                cpus: os.cpus().length,
-                diskTotal,
-                diskUsed,
-                diskPercent
-            });
-        });
-    });
-});
-
-// ============================================
-// API: ФАЙЛЫ
-// ============================================
-app.get('/api/files', requireAuth, (req, res) => {
-    const dir = req.query.path || os.homedir();
-    try {
-        const items = fs.readdirSync(dir).map(name => {
-            try {
-                const fullPath = path.join(dir, name);
-                const stat = fs.statSync(fullPath);
-                return {
-                    name,
-                    isDirectory: stat.isDirectory(),
-                    size: stat.size,
-                    modified: stat.mtime,
-                    permissions: '0' + (stat.mode & parseInt('777', 8)).toString(8)
-                };
-            } catch {
-                return { name, isDirectory: false, size: 0, modified: null, permissions: '---' };
-            }
-        });
-        res.json({ path: dir, items });
-    } catch (e) {
-        res.status(400).json({ error: e.message });
-    }
-});
-
-// Скачивание файла
-app.get('/api/files/download', requireAuth, (req, res) => {
-    const filePath = req.query.path;
-    if (!filePath || !fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'Файл не найден' });
-    }
-    res.download(filePath);
-});
-
-// Удаление файла
-app.post('/api/files/delete', requireAuth, (req, res) => {
-    const { filePath } = req.body;
-    try {
-        const stat = fs.statSync(filePath);
-        if (stat.isDirectory()) {
-            fs.rmSync(filePath, { recursive: true });
-        } else {
-            fs.unlinkSync(filePath);
-        }
-        res.json({ success: true });
-    } catch (e) {
-        res.json({ success: false, error: e.message });
-    }
-});
-
-// Создание папки
-app.post('/api/files/mkdir', requireAuth, (req, res) => {
-    const { dirPath } = req.body;
-    try {
-        fs.mkdirSync(dirPath, { recursive: true });
-        res.json({ success: true });
-    } catch (e) {
-        res.json({ success: false, error: e.message });
-    }
-});
-
-// Загрузка файлов
-app.post('/api/upload', requireAuth, upload.array('files', 50), (req, res) => {
-    if (!req.files || req.files.length === 0) {
-        return res.json({ success: false, error: 'Файлы не получены' });
-    }
-    const uploaded = req.files.map(f => ({
-        name: f.originalname,
-        size: f.size,
-        path: f.path
-    }));
-    res.json({ success: true, files: uploaded });
-});
-
-// Чтение текстового файла
-app.get('/api/files/read', requireAuth, (req, res) => {
-    const filePath = req.query.path;
-    try {
-        const stat = fs.statSync(filePath);
-        if (stat.size > 2 * 1024 * 1024) {
-            return res.json({ error: 'Файл слишком большой (макс 2MB)' });
-        }
-        const content = fs.readFileSync(filePath, 'utf8');
-        res.json({ success: true, content, size: stat.size });
-    } catch (e) {
-        res.json({ success: false, error: e.message });
-    }
-});
-
-// Сохранение файла
-app.post('/api/files/save', requireAuth, (req, res) => {
-    const { filePath, content } = req.body;
-    try {
-        fs.writeFileSync(filePath, content, 'utf8');
-        res.json({ success: true });
-    } catch (e) {
-        res.json({ success: false, error: e.message });
-    }
-});
-
-// ============================================
-// API: ПРОЦЕССЫ
-// ============================================
-app.get('/api/processes', requireAuth, (req, res) => {
-    exec('ps aux 2>/dev/null || ps', (err, stdout) => {
-        const lines = stdout.trim().split('\n');
-        const processes = lines.slice(1).map(line => {
-            const parts = line.trim().split(/\s+/);
-            return {
-                user: parts[0],
-                pid: parts[1],
-                cpu: parts[2] || '0',
-                mem: parts[3] || '0',
-                command: parts.slice(10).join(' ') || parts.slice(4).join(' ')
-            };
-        }).filter(p => p.pid);
-        res.json(processes);
-    });
-});
-
-// Убить процесс
-app.post('/api/processes/kill', requireAuth, (req, res) => {
-    const { pid } = req.body;
-    exec(`kill ${pid}`, (err) => {
-        res.json({ success: !err, error: err ? err.message : null });
-    });
-});
-
-// ============================================
-// API: СЕРВИСЫ (БОТЫ)
-// ============================================
-const runningProcesses = {};
-
-app.get('/api/services', requireAuth, (req, res) => {
-    const services = {};
-    for (const [name, info] of Object.entries(runningProcesses)) {
-        services[name] = {
-            pid: info.pid,
-            command: info.command,
-            cwd: info.cwd,
-            startedAt: info.startedAt,
-            logs: info.logs.slice(-50)
-        };
-    }
-    res.json(services);
-});
-
-app.post('/api/service/start', requireAuth, (req, res) => {
-    const { name, command, cwd } = req.body;
-
-    if (!name || !command) {
-        return res.json({ success: false, error: 'Укажите имя и команду' });
-    }
-
-    if (runningProcesses[name]) {
-        return res.json({ success: false, error: 'Уже запущен' });
-    }
-
-    const workDir = cwd || os.homedir();
-    const parts = command.split(' ');
-
-    try {
-        const proc = spawn(parts[0], parts.slice(1), {
-            cwd: workDir,
-            env: { ...process.env, HOME: os.homedir() }
-        });
-
-        runningProcesses[name] = {
-            process: proc,
-            pid: proc.pid,
-            command,
-            cwd: workDir,
-            startedAt: new Date().toISOString(),
-            logs: []
-        };
-
-        proc.stdout.on('data', (data) => {
-            const text = data.toString();
-            runningProcesses[name]?.logs.push({ type: 'stdout', text, time: new Date().toISOString() });
-            if (runningProcesses[name]?.logs.length > 200) {
-                runningProcesses[name].logs = runningProcesses[name].logs.slice(-100);
-            }
-            io.emit('service-log', { service: name, type: 'stdout', data: text });
-        });
-
-        proc.stderr.on('data', (data) => {
-            const text = data.toString();
-            runningProcesses[name]?.logs.push({ type: 'stderr', text, time: new Date().toISOString() });
-            io.emit('service-log', { service: name, type: 'stderr', data: text });
-        });
-
-        proc.on('exit', (code) => {
-            io.emit('service-stopped', { name, code });
-            delete runningProcesses[name];
-        });
-
-        proc.on('error', (err) => {
-            io.emit('service-log', { service: name, type: 'stderr', data: 'Error: ' + err.message });
-            delete runningProcesses[name];
-        });
-
-        res.json({ success: true, pid: proc.pid });
-    } catch (e) {
-        res.json({ success: false, error: e.message });
-    }
-});
-
-app.post('/api/service/stop', requireAuth, (req, res) => {
-    const { name } = req.body;
-    if (runningProcesses[name]) {
-        try {
-            runningProcesses[name].process.kill('SIGTERM');
-            setTimeout(() => {
-                if (runningProcesses[name]) {
-                    runningProcesses[name].process.kill('SIGKILL');
-                    delete runningProcesses[name];
-                }
-            }, 3000);
-        } catch (e) {}
-        delete runningProcesses[name];
-        res.json({ success: true });
-    } else {
-        res.json({ success: false, error: 'Не найден' });
-    }
-});
-
-app.post('/api/service/restart', requireAuth, (req, res) => {
-    const { name } = req.body;
-    if (runningProcesses[name]) {
-        const { command, cwd } = runningProcesses[name];
-        try { runningProcesses[name].process.kill(); } catch (e) {}
-        delete runningProcesses[name];
-
-        setTimeout(() => {
-            const parts = command.split(' ');
-            const proc = spawn(parts[0], parts.slice(1), { cwd });
-            runningProcesses[name] = {
-                process: proc, pid: proc.pid, command, cwd,
-                startedAt: new Date().toISOString(), logs: []
-            };
-            proc.stdout.on('data', (data) => {
-                runningProcesses[name]?.logs.push({ type: 'stdout', text: data.toString() });
-                io.emit('service-log', { service: name, type: 'stdout', data: data.toString() });
-            });
-            proc.stderr.on('data', (data) => {
-                runningProcesses[name]?.logs.push({ type: 'stderr', text: data.toString() });
-                io.emit('service-log', { service: name, type: 'stderr', data: data.toString() });
-            });
-            proc.on('exit', () => { delete runningProcesses[name]; });
-            res.json({ success: true, pid: proc.pid });
-        }, 1000);
-    } else {
-        res.json({ success: false, error: 'Не найден' });
-    }
-});
-
-// ============================================
-// API: ВЫПОЛНЕНИЕ КОМАНД
-// ============================================
-app.post('/api/run', requireAuth, (req, res) => {
-    const { command, cwd } = req.body;
-    exec(command, {
-        timeout: 30000,
-        cwd: cwd || os.homedir(),
-        env: { ...process.env, HOME: os.homedir() }
-    }, (err, stdout, stderr) => {
-        res.json({
-            success: !err,
-            stdout: stdout || '',
-            stderr: stderr || '',
-            error: err ? err.message : null
-        });
-    });
-});
-
-// ============================================
-// WEBSOCKET
-// ============================================
-io.on('connection', (socket) => {
-    console.log('Клиент подключён');
-
-    socket.on('terminal-input', (data) => {
-        exec(data.command, {
-            timeout: 30000,
-            cwd: data.cwd || os.homedir(),
-            env: { ...process.env, HOME: os.homedir() }
-        }, (err, stdout, stderr) => {
-            socket.emit('terminal-output', {
-                stdout: stdout || '',
-                stderr: stderr || err?.message || ''
-            });
-        });
-    });
-
-    socket.on('disconnect', () => {
-        console.log('Клиент отключён');
-    });
-});
-
-// ============================================
-// ГЛАВНАЯ СТРАНИЦА (ПОСЛЕ АВТОРИЗАЦИИ)
-// ============================================
-app.get('/', requireAuth, (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Статика
-app.use(express.static('public'));
-
-// ============================================
-// ЗАПУСК
-// ============================================
-server.listen(PORT, '0.0.0.0', () => {
-    console.log('');
-    console.log('🚀 ================================');
-    console.log(`🚀  Сервер запущен на порту ${PORT}`);
-    console.log('🚀 ================================');
-    console.log('');
-
-    // Показываем IP-адреса
-    const nets = os.networkInterfaces();
-    for (const name of Object.keys(nets)) {
-        for (const net of nets[name]) {
-            if (net.family === 'IPv4' && !net.internal) {
-                console.log(`📡 Открой: http://${net.address}:${PORT}`);
-            }
-        }
-    }
-    console.log(`📡 Локально: http://localhost:${PORT}`);
-    console.log('');
-    console.log('👤 Логин: admin');
-    console.log('🔑 Пароль: admin123');
-    console.log('');
-});
